@@ -13,8 +13,6 @@ import {
   Phone,
   FileText,
   MapPin,
-  Smartphone,
-  Banknote,
   Loader2,
   CheckCircle2,
 } from "lucide-react";
@@ -38,14 +36,17 @@ const PRICING = {
 };
 const DUREE_LABEL = { "1": "1 mois", "2": "2 mois", "3": "3 mois", "12": "12 mois" };
 
-// Moyens de paiement proposés pour régler l'abonnement avant de recevoir la carte.
-const PAYMENT_METHODS = [
-  { id: "orange", label: "Orange Money", icon: Smartphone },
-  { id: "mtn", label: "MTN Mobile Money", icon: Smartphone },
-  { id: "moov", label: "Moov Money", icon: Smartphone },
-  { id: "wave", label: "Wave", icon: Smartphone },
-  { id: "carte", label: "Carte bancaire", icon: CreditCard },
-  { id: "especes", label: "Espèces (à l'agence)", icon: Banknote },
+// URL du backend de paiement (voir rangou-backend). À remplir une fois
+// déployé sur Render, ex: "https://rangou-backend-xxxx.onrender.com"
+const BACKEND_URL = "https://rangou-backend.onrender.com";
+
+// Numéros à afficher à l'acheteur pour effectuer le paiement manuel.
+// Remplacez par vos vrais numéros une fois prêt.
+const PAYMENT_NUMBERS = [
+  { label: "Orange Money", numero: "+221 77 486 52 30" },
+  { label: "MTN Mobile Money", numero: "+221 77 486 52 30" },
+  { label: "Moov Money", numero: "+221 77 486 52 30" },
+  { label: "Wave", numero: "+221 77 486 52 30" },
 ];
 
 // Aucun produit pré-rempli : n'importe quel type de marchandise (alimentaire,
@@ -248,9 +249,10 @@ export default function App() {
     codeAcces: "",
   });
   const [aCard, setACard] = useState(null);
-  const [aStep, setAStep] = useState("form"); // form | payment
-  const [paymentMethod, setPaymentMethod] = useState(null);
+  const [aStep, setAStep] = useState("form"); // form | payment | waiting
   const [payingNow, setPayingNow] = useState(false);
+  const [paymentError, setPaymentError] = useState("");
+  const [transactionId, setTransactionId] = useState(null);
 
   const [form, setForm] = useState({
     marchandise: "",
@@ -442,43 +444,70 @@ export default function App() {
     setAStep("payment");
   }
 
-  // La carte n'est générée et sauvegardée qu'une fois le paiement confirmé —
-  // impossible d'y accéder avant.
-  async function handleConfirmPayment() {
-    if (!paymentMethod) {
-      showToast("Choisis un moyen de paiement.");
+  // La carte n'est générée qu'après vérification manuelle du paiement par
+  // l'admin (voir /admin sur le backend). On envoie d'abord la demande...
+  async function handleRequestPayment() {
+    if (!BACKEND_URL) {
+      showToast("Le serveur de paiement n'est pas encore configuré.");
       return;
     }
     setPayingNow(true);
-    setTimeout(async () => {
-      const dureeMois = parseInt(aForm.duree, 10);
+    setPaymentError("");
+    try {
       const montant = PRICING[aForm.type][aForm.duree];
-      const now = new Date();
-      const card = {
-        id: `${Date.now()}`,
-        nom: aForm.nom.trim(),
-        telephone: aForm.telephone.trim(),
-        type: aForm.type,
-        duree: aForm.duree,
-        montant,
-        moyenPaiement: PAYMENT_METHODS.find((m) => m.id === paymentMethod)?.label || paymentMethod,
-        carteIdentite: aForm.carteIdentite,
-        codeAcces: aForm.codeAcces,
-        numero: genCardNumber(),
-        dateCreation: now.toISOString(),
-        expiration: addMonths(now, dureeMois).toISOString(),
-      };
-      const next = [...abonnements, card];
-      setAbonnements(next);
-      try {
-        await window.storage.set(ABONNEMENT_KEY, JSON.stringify(next), true);
-      } catch (err) {
-        // best-effort
-      }
+      const res = await fetch(`${BACKEND_URL}/api/payments/request`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          nom: aForm.nom.trim(),
+          telephone: aForm.telephone.trim(),
+          montant,
+          abonnementForm: aForm,
+        }),
+      });
+      if (!res.ok) throw new Error("Échec de la demande");
+      const data = await res.json();
+      setTransactionId(data.transaction_id);
+      setAStep("waiting");
+    } catch (err) {
+      showToast("Impossible de contacter le serveur de paiement.");
+    } finally {
       setPayingNow(false);
-      setACard(card);
-    }, 1400);
+    }
   }
+
+  // ...puis on attend que l'admin confirme (polling du statut).
+  useEffect(() => {
+    if (aStep !== "waiting" || !transactionId || !BACKEND_URL) return;
+    let cancelled = false;
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/payments/${transactionId}/status`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        if (data.statut === "confirmee" && data.carte) {
+          const next = [...abonnements, data.carte];
+          setAbonnements(next);
+          try {
+            await window.storage.set(ABONNEMENT_KEY, JSON.stringify(next), true);
+          } catch (e) {
+            // best-effort
+          }
+          setACard(data.carte);
+        } else if (data.statut === "refusee") {
+          setPaymentError("Ce paiement a été rejeté. Vérifiez le montant et réessayez.");
+          setAStep("payment");
+        }
+      } catch (e) {
+        // on réessaiera au prochain intervalle
+      }
+    }, 4000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [aStep, transactionId, abonnements]);
 
   async function handleIdCardChange(e) {
     const file = e.target.files && e.target.files[0];
@@ -511,8 +540,9 @@ export default function App() {
       setPage(null);
       setACard(null);
       setAStep("form");
-      setPaymentMethod(null);
       setPayingNow(false);
+      setPaymentError("");
+      setTransactionId(null);
       setAForm({
         nom: "",
         telephone: "",
@@ -713,16 +743,13 @@ export default function App() {
     }
   }
 
-  // ---------- ABONNEMENT : PAIEMENT (obligatoire avant d'obtenir la carte) ----------
+  // ---------- ABONNEMENT : PAIEMENT (instructions manuelles) ----------
   if (page === "abonnement" && aStep === "payment") {
     const montant = PRICING[aForm.type][aForm.duree];
-    const backToForm = () => {
-      setAStep("form");
-      setPaymentMethod(null);
-    };
+    const backToForm = () => setAStep("form");
     return (
       <Screen>
-        <TopBar title="Paiement" onBack={payingNow ? undefined : backToForm} />
+        <TopBar title="Paiement" onBack={backToForm} />
         <div
           style={{
             display: "flex",
@@ -744,66 +771,62 @@ export default function App() {
           <div style={{ fontSize: 20, fontWeight: 800, color: GOLD }}>{fmtFCFA(montant)}</div>
         </div>
 
+        {paymentError ? (
+          <div style={{ background: "#FBEAEA", border: "1px solid #E3B4B4", borderRadius: 12, padding: 12, marginBottom: 16, fontSize: 13, color: "#8A2E2E" }}>
+            {paymentError}
+          </div>
+        ) : null}
+
         <div style={{ fontSize: 13, color: "#6B7385", marginBottom: 10 }}>
-          Choisis un moyen de paiement
+          Envoyez {fmtFCFA(montant)} à l'un de ces numéros
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
-          {PAYMENT_METHODS.map((m) => {
-            const Icon = m.icon;
-            const active = paymentMethod === m.id;
-            return (
-              <button
-                key={m.id}
-                type="button"
-                disabled={payingNow}
-                onClick={() => setPaymentMethod(m.id)}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 12,
-                  padding: "13px 14px",
-                  borderRadius: 14,
-                  border: `1px solid ${active ? BLUE : LINE}`,
-                  background: active ? "#EAF0FA" : CARD,
-                  cursor: payingNow ? "not-allowed" : "pointer",
-                  fontFamily: "inherit",
-                  textAlign: "left",
-                }}
-              >
-                <div
-                  style={{
-                    width: 36,
-                    height: 36,
-                    borderRadius: 10,
-                    background: active ? BLUE : PAPER,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    flexShrink: 0,
-                  }}
-                >
-                  <Icon size={17} color={active ? "#fff" : BLUE} />
-                </div>
-                <span style={{ fontSize: 15, fontWeight: 600, color: INK }}>{m.label}</span>
-                {active && (
-                  <CheckCircle2 size={18} color={BLUE} style={{ marginLeft: "auto" }} />
-                )}
-              </button>
-            );
-          })}
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 20 }}>
+          {PAYMENT_NUMBERS.map((p) => (
+            <div
+              key={p.label}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                padding: "12px 14px",
+                borderRadius: 12,
+                border: `1px solid ${LINE}`,
+                background: CARD,
+              }}
+            >
+              <span style={{ fontSize: 14, color: "#6B7385" }}>{p.label}</span>
+              <span style={{ fontSize: 15, fontWeight: 700, color: INK }}>{p.numero}</span>
+            </div>
+          ))}
         </div>
+        <p style={{ fontSize: 12, color: "#9099A8", marginBottom: 20 }}>
+          Une fois l'envoi effectué, appuyez sur le bouton ci-dessous. Votre carte
+          sera activée dès que le paiement sera vérifié (généralement en quelques minutes).
+        </p>
 
         <div style={{ flex: 1 }} />
-        <PrimaryButton onClick={handleConfirmPayment} disabled={!paymentMethod || payingNow}>
-          {payingNow ? (
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-              <Loader2 size={17} style={{ animation: "rangou-spin 0.8s linear infinite" }} />
-              Paiement en cours…
-            </span>
-          ) : (
-            `Payer ${fmtFCFA(montant)}`
-          )}
+        <PrimaryButton onClick={handleRequestPayment} disabled={payingNow}>
+          {payingNow ? "Envoi en cours…" : "J'ai payé, vérifier mon paiement"}
         </PrimaryButton>
+        {toast && <Toast>{toast}</Toast>}
+      </Screen>
+    );
+  }
+
+  // ---------- ABONNEMENT : ATTENTE DE CONFIRMATION ----------
+  if (page === "abonnement" && aStep === "waiting") {
+    return (
+      <Screen>
+        <TopBar title="Vérification" onBack={undefined} />
+        <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 16, textAlign: "center" }}>
+          <Loader2 size={40} color={BLUE} style={{ animation: "rangou-spin 1s linear infinite" }} />
+          <div style={{ fontSize: 16, fontWeight: 700, color: INK }}>En attente de vérification…</div>
+          <p style={{ fontSize: 13, color: "#6B7385", maxWidth: 260 }}>
+            Nous vérifions la réception de votre paiement. Cette page se mettra à
+            jour automatiquement dès que ce sera confirmé — pas besoin de fermer
+            l'application.
+          </p>
+        </div>
         <style>{`@keyframes rangou-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
         {toast && <Toast>{toast}</Toast>}
       </Screen>
